@@ -1,125 +1,116 @@
 import os
-import pandas as pd
-import numpy as np
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when
+from pyspark.ml.feature import VectorAssembler, StandardScaler, Imputer, OneHotEncoder, StringIndexer
+from pyspark.ml.classification import LogisticRegression, RandomForestClassifier, GBTClassifier, DecisionTreeClassifier
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml import Pipeline
+from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.impute import SimpleImputer, KNNImputer
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from xgboost import XGBClassifier
-from sklearn.feature_selection import SelectKBest, f_classif
-from sklearn.metrics import classification_report, roc_auc_score, accuracy_score, f1_score
-import joblib
-import warnings
+import pandas as pd
 
-warnings.filterwarnings('ignore')
+# Initialiser une session Spark
+spark = SparkSession.builder \
+    .appName("FlightDelayPrediction") \
+    .getOrCreate()
 
 # Charger les données
 file_path = 'data/flights.csv'
 if not os.path.exists(file_path):
     raise FileNotFoundError(f"Le fichier spécifié n'existe pas: {file_path}")
-df = pd.read_csv(file_path)
-df = df.sample(n=50000, random_state=42)
 
-# Comparaison des techniques de preprocessing
-def preprocess_data(df, imputation_strategy='mean', scaling_strategy='standard'):
-    df = df.drop(columns=['YEAR', 'FLIGHT_NUMBER', 'TAIL_NUMBER', 'CANCELLATION_REASON', 
-                          'AIR_SYSTEM_DELAY', 'SECURITY_DELAY', 'AIRLINE_DELAY', 
-                          'LATE_AIRCRAFT_DELAY', 'WEATHER_DELAY'])
-    
-    numeric_features = ['DEPARTURE_DELAY', 'TAXI_OUT', 'TAXI_IN', 'ARRIVAL_DELAY']
-    
-    if imputation_strategy == 'mean':
-        imputer = SimpleImputer(strategy='mean')
-    elif imputation_strategy == 'median':
-        imputer = SimpleImputer(strategy='median')
-    elif imputation_strategy == 'knn':
-        imputer = KNNImputer(n_neighbors=5)
-    
-    df[numeric_features] = imputer.fit_transform(df[numeric_features])
-    df = df.dropna()
-    df = pd.get_dummies(df, columns=['AIRLINE', 'ORIGIN_AIRPORT', 'DESTINATION_AIRPORT'])
-    
-    if scaling_strategy == 'standard':
-        scaler = StandardScaler()
-    elif scaling_strategy == 'minmax':
-        scaler = MinMaxScaler()
-    
-    df[['DEPARTURE_DELAY', 'TAXI_OUT', 'TAXI_IN']] = scaler.fit_transform(df[['DEPARTURE_DELAY', 'TAXI_OUT', 'TAXI_IN']])
-    
-    df['NEW_FEATURE'] = df['MONTH'] * df['DAY_OF_WEEK']
-    return df
+df = spark.read.option("header", "true").csv(file_path)
 
-# Comparaison avec et sans feature engineering
-df_fe = preprocess_data(df, imputation_strategy='mean', scaling_strategy='standard')
-df_no_fe = df_fe.drop(columns=['NEW_FEATURE'])
+# Afficher les premières lignes du DataFrame Spark
+df.printSchema()
+df.show(5)
 
-# Définition de la target
-X_fe, y_fe = df_fe.drop('ARRIVAL_DELAY', axis=1), df_fe['ARRIVAL_DELAY'].apply(lambda x: 1 if x > 15 else 0)
-X_no_fe, y_no_fe = df_no_fe.drop('ARRIVAL_DELAY', axis=1), y_fe
+# Convertir les colonnes numériques
+numeric_features = ['DEPARTURE_DELAY', 'TAXI_OUT', 'TAXI_IN', 'ARRIVAL_DELAY']
+for feature in numeric_features:
+    df = df.withColumn(feature, col(feature).cast("double"))
 
-X_train_fe, X_test_fe, y_train_fe, y_test_fe = train_test_split(X_fe, y_fe, test_size=0.3, random_state=42)
-X_train_no_fe, X_test_no_fe, y_train_no_fe, y_test_no_fe = train_test_split(X_no_fe, y_no_fe, test_size=0.3, random_state=42)
+# Prétraitement des données
+# Suppression de colonnes non pertinentes
+df = df.drop('YEAR', 'FLIGHT_NUMBER', 'TAIL_NUMBER', 'CANCELLATION_REASON', 
+             'AIR_SYSTEM_DELAY', 'SECURITY_DELAY', 'AIRLINE_DELAY', 
+             'LATE_AIRCRAFT_DELAY', 'WEATHER_DELAY')
 
-# Comparaison des modèles et Feature Selection
-def train_and_evaluate_model(X_train, X_test, y_train, y_test, feature_selection=False):
-    models = {
-        'Logistic Regression': LogisticRegression(max_iter=1000),
-        'Random Forest': RandomForestClassifier(),
-        'Gradient Boosting': GradientBoostingClassifier(),
-        'Decision Tree': DecisionTreeClassifier(),
-        'XGBoost': XGBClassifier()
-    }
+# Remplir les valeurs manquantes pour les colonnes numériques et catégorielles
+imputer = Imputer(inputCols=numeric_features, outputCols=numeric_features)
+df = imputer.fit(df).transform(df)
+
+# Convertir les données catégorielles
+categorical_features = ['AIRLINE', 'ORIGIN_AIRPORT', 'DESTINATION_AIRPORT']
+indexers = [StringIndexer(inputCol=column, outputCol=column + "_index") for column in categorical_features]
+encoders = [OneHotEncoder(inputCol=indexer.getOutputCol(), outputCol=indexer.getOutputCol() + "_vec") for indexer in indexers]
+
+# Ajouter des colonnes dérivées
+df = df.withColumn('NEW_FEATURE', col('MONTH') * col('DAY_OF_WEEK'))
+
+# Assembler les features
+assembler = VectorAssembler(
+    inputCols=[col + "_index_vec" for col in categorical_features] + numeric_features + ['NEW_FEATURE'],
+    outputCol="features")
+
+# Normaliser les données
+scaler = StandardScaler(inputCol="features", outputCol="scaled_features")
+
+# Définir la colonne étiquette (label)
+df = df.withColumn("label", when(col("ARRIVAL_DELAY") > 15, 1).otherwise(0))
+
+# Diviser les données en ensemble d'entraînement et de test
+train_data, test_data = df.randomSplit([0.7, 0.3], seed=42)
+
+# Définir et entraîner les modèles
+models = {
+    'Logistic Regression': LogisticRegression(featuresCol="scaled_features"),
+    'Random Forest': RandomForestClassifier(featuresCol="scaled_features"),
+    'Gradient Boosting': GBTClassifier(featuresCol="scaled_features"),
+    'Decision Tree': DecisionTreeClassifier(featuresCol="scaled_features")
+}
+
+# Pipeline commun
+pipeline_stages = indexers + encoders + [assembler, scaler]
+results = {}
+
+# Optimisation des hyperparamètres avec CrossValidator et ParamGridBuilder
+param_grid = ParamGridBuilder() \
+    .addGrid(models['Logistic Regression'].regParam, [0.1, 0.01]) \
+    .addGrid(models['Random Forest'].numTrees, [10, 20]) \
+    .build()
+
+cross_validator = CrossValidator(estimator=models['Logistic Regression'],
+                                 estimatorParamMaps=param_grid,
+                                 evaluator=BinaryClassificationEvaluator(),
+                                 numFolds=3)
+
+for name, model in models.items():
+    print(f"Training {name}...")
+    pipeline = Pipeline(stages=pipeline_stages + [model])
+    model_fit = pipeline.fit(train_data)
+    predictions = model_fit.transform(test_data)
     
-    if feature_selection:
-        selector = SelectKBest(score_func=f_classif, k=10)
-        X_train = selector.fit_transform(X_train, y_train)
-        X_test = selector.transform(X_test)
+    evaluator = BinaryClassificationEvaluator()
+    accuracy = evaluator.evaluate(predictions, {evaluator.metricName: "areaUnderROC"})
     
-    results = {}
-    for name, model in models.items():
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        accuracy = accuracy_score(y_test, y_pred)
-        f1 = f1_score(y_test, y_pred)
-        roc_auc = roc_auc_score(y_test, y_pred)
-        results[name] = {'accuracy': accuracy, 'f1': f1, 'roc_auc': roc_auc}
-        print(f"{name} - Accuracy: {accuracy:.4f}, F1: {f1:.4f}, ROC AUC: {roc_auc:.4f}")
-        print(classification_report(y_test, y_pred))
-        joblib.dump(model, f'{name.replace(" ", "_").lower()}_model.pkl')
-    
-    return results
+    print(f"{name} - ROC AUC: {accuracy:.4f}")
+    results[name] = accuracy
 
-# Comparaison avec un modèle baseline
-def baseline_model(y_test):
-    y_pred_baseline = np.zeros_like(y_test)
-    accuracy = accuracy_score(y_test, y_pred_baseline)
-    f1 = f1_score(y_test, y_pred_baseline)
-    roc_auc = roc_auc_score(y_test, y_pred_baseline)
-    print(f"Baseline Model - Accuracy: {accuracy:.4f}, F1: {f1:.4f}, ROC AUC: {roc_auc:.4f}")
-    return {'accuracy': accuracy, 'f1': f1, 'roc_auc': roc_auc}
+# Comparaison des résultats
+print("Comparaison des modèles :")
+df_results = pd.DataFrame(list(results.items()), columns=['Modèle', 'ROC AUC'])
+print(df_results)
 
-# Exécution des expériences
-def main():
-    print("\nModèles avec Feature Engineering:")
-    results_fe = train_and_evaluate_model(X_train_fe, X_test_fe, y_train_fe, y_test_fe)
-    print("\nModèles sans Feature Engineering:")
-    results_no_fe = train_and_evaluate_model(X_train_no_fe, X_test_no_fe, y_train_no_fe, y_test_no_fe)
-    print("\nModèles avec Sélection de Variables:")
-    results_fs = train_and_evaluate_model(X_train_fe, X_test_fe, y_train_fe, y_test_fe, feature_selection=True)
-    print("\nModèle Baseline:")
-    baseline_results = baseline_model(y_test_fe)
-    
-    # Comparaison des performances
-    comparison_df = pd.DataFrame({'With Feature Engineering': results_fe,
-                                   'Without Feature Engineering': results_no_fe,
-                                   'With Feature Selection': results_fs,
-                                   'Baseline': baseline_results}).T
-    print(comparison_df)
-    comparison_df.to_csv('comparison_results.csv')
+# Visualisation des résultats
+plt.figure(figsize=(10, 6))
+sns.barplot(x='Modèle', y='ROC AUC', data=df_results)
+plt.title('Comparaison des modèles')
+plt.ylabel('Score')
+plt.xlabel('Modèles')
+plt.xticks(rotation=45)
+plt.show()
 
-if __name__ == "__main__":
-    main()
+# Arrêter la session Spark
+spark.stop()
